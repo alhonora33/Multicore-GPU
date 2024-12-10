@@ -5,13 +5,16 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <immintrin.h>
+#include <starpu.h>
+
 
 #define ELEMENT_TYPE float
 
 #define DEFAULT_MESH_WIDTH 2000
 #define DEFAULT_MESH_HEIGHT 1000
 #define DEFAULT_NB_ITERATIONS 100
-#define DEFAULT_NB_REPEAT 10
+#define DEFAULT_NB_REPEAT 100
 
 #define STENCIL_WIDTH 3
 #define STENCIL_HEIGHT 3
@@ -221,6 +224,7 @@ static void allocate_mesh(ELEMENT_TYPE **pp_mesh, struct s_settings *p_settings)
 {
         assert(*pp_mesh == NULL);
         ELEMENT_TYPE *p_mesh = calloc(p_settings->mesh_width * p_settings->mesh_height, sizeof(*p_mesh));
+
         if (p_mesh == NULL)
         {
                 PRINT_ERROR("memory allocation failed");
@@ -394,6 +398,355 @@ static void write_mesh_to_file(FILE *file, const ELEMENT_TYPE *p_mesh, struct s_
         }
 }
 
+// ---------------------------------------------
+//               AVX implementation
+// ---------------------------------------------
+
+static void avx_stencil_func(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
+{
+        const int margin_x = (STENCIL_WIDTH - 1) / 2;
+        const int margin_y = (STENCIL_HEIGHT - 1) / 2;
+        int x;
+        int y;
+
+        ELEMENT_TYPE *p_temporary_mesh = calloc(p_settings->mesh_width * p_settings->mesh_height, p_settings->mesh_width * p_settings->mesh_height * sizeof(*p_mesh));
+
+        __m256 side_coefficients = _mm256_set_ps(0.25 / 3, 0.50 / 3, 0.25 / 3, 0, 0, 0.25 / 3, 0.50 / 3, 0.25 / 3);
+        __m256 middle_coefficients = _mm256_set_ps(0.50 / 3, 0, 0.50 / 3, 0, 0, 0.50 / 3, 0, 0.50 / 3);
+
+        for (y = 0; y < p_settings->mesh_height - margin_y; y++)
+        {
+                for (x = 0; x + 3 < p_settings->mesh_width; x += 2)
+                {
+                        int offset_row_1 = (y * p_settings->mesh_width + x);
+                        int offset_row_2 = ((y + 1) * p_settings->mesh_width + x);
+
+                        __m128 lower_half_row_1 = _mm_loadu_ps(p_mesh + offset_row_1);
+                        __m256 avx_row_1 = _mm256_set_m128(lower_half_row_1, lower_half_row_1);
+
+                        __m128 lower_half_row_2 = _mm_loadu_ps(p_mesh + offset_row_2);
+                        __m256 avx_row_2 = _mm256_set_m128(lower_half_row_2, lower_half_row_2);
+                        __m256 avx_row_2_middle = avx_row_2;
+
+                        avx_row_1 = _mm256_mul_ps(avx_row_1, side_coefficients);
+                        avx_row_2 = _mm256_mul_ps(avx_row_2, side_coefficients);
+                        avx_row_2_middle = _mm256_fmadd_ps(avx_row_2_middle, middle_coefficients, avx_row_1);
+
+                        p_temporary_mesh[offset_row_1 + 1] += avx_row_2[0] + avx_row_2[1] + avx_row_2[2] + avx_row_2[3];
+                        p_temporary_mesh[offset_row_1 + 2] += avx_row_2[4] + avx_row_2[5] + avx_row_2[6] + avx_row_2[7];
+
+                        p_temporary_mesh[offset_row_2 + 1] += avx_row_2_middle[0] + avx_row_2_middle[1] + avx_row_2_middle[2] + avx_row_2_middle[3];
+                        p_temporary_mesh[offset_row_2 + 2] += avx_row_2_middle[4] + avx_row_2_middle[5] + avx_row_2_middle[6] + avx_row_2_middle[7];
+                }
+        }
+
+        for (x = margin_x; x < p_settings->mesh_width - margin_x; x++)
+        {
+                for (y = margin_y; y < p_settings->mesh_height - margin_y; y++)
+                {
+                        p_mesh[y * p_settings->mesh_width + x] = p_temporary_mesh[y * p_settings->mesh_width + x];
+                }
+        }
+        free(p_temporary_mesh);
+}
+
+// ---------------------------------------------
+
+
+// ---------------------------------------------
+//               STAR_PU implementation
+// ---------------------------------------------
+
+static void adapted_naive_stencil_func(const ELEMENT_TYPE *p_mesh, ELEMENT_TYPE *p_result_mesh, struct s_settings *p_settings)
+{
+        const int margin_x = (STENCIL_WIDTH - 1) / 2;
+        const int margin_y = (STENCIL_HEIGHT - 1) / 2;
+        int x;
+        int y;
+        for (y = margin_y; y < p_settings->mesh_height - margin_y; y++)
+        {
+                for (x = margin_x; x < p_settings->mesh_width - margin_x; x++)
+                {
+                        ELEMENT_TYPE value = p_mesh[y * p_settings->mesh_width + x];
+                        int stencil_x, stencil_y;
+                        for (stencil_x = 0; stencil_x < STENCIL_WIDTH; stencil_x++)
+                        {
+                                for (stencil_y = 0; stencil_y < STENCIL_HEIGHT; stencil_y++)
+                                {
+                                        value +=
+                                            p_mesh[(y + stencil_y - margin_y) * p_settings->mesh_width + (x + stencil_x - margin_x)] * stencil_coefs[stencil_y * STENCIL_WIDTH + stencil_x];
+                                }
+                        }
+                        p_result_mesh[y * p_settings->mesh_width + x - 1] = value;
+                }
+        }
+}
+static void tile_stencil_func(void *buffer[], void *cl_arg)
+{   
+        ELEMENT_TYPE *p_tile = (ELEMENT_TYPE *)STARPU_MATRIX_GET_PTR(buffer[0]);
+
+        ELEMENT_TYPE *p_tile_result = (ELEMENT_TYPE *)STARPU_MATRIX_GET_PTR(buffer[1]);
+        struct s_settings p_settings;
+        starpu_codelet_unpack_args(cl_arg, &p_settings) ;
+        adapted_naive_stencil_func(p_tile, p_tile_result, &p_settings);
+}
+static void starpu_stencil_func(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
+{
+        const int margin_x = (STENCIL_WIDTH - 1) / 2;
+        const int margin_y = (STENCIL_HEIGHT - 1) / 2;
+
+        const int block_count = 4;
+        const int tile_height = (p_settings->mesh_height - 2) / block_count;
+
+        ELEMENT_TYPE *p_mesh_result = calloc(p_settings->mesh_height * p_settings->mesh_width, sizeof(float));
+        
+        int ret = starpu_init(NULL);
+        STARPU_CHECK_RETURN_VALUE(ret, "starpu_init");
+
+        struct starpu_codelet stencil_codelet = {
+                .cpu_funcs = {tile_stencil_func},
+		.nbuffers = 2,
+		.modes = {STARPU_R}
+        };
+
+
+	starpu_data_handle_t* handles_read = malloc(block_count * sizeof(starpu_data_handle_t));
+	starpu_data_handle_t* handles_write = malloc(block_count * sizeof(starpu_data_handle_t));
+
+        
+
+        
+        struct s_settings settings_for_tile = {
+                .mesh_width = p_settings->mesh_width,
+                .mesh_height = tile_height + 2,
+                .initial_mesh_type = p_settings->initial_mesh_type,
+                .nb_iterations = p_settings->nb_iterations,
+                .nb_repeat = p_settings->nb_repeat,
+                .enable_output = p_settings->enable_output,
+                .enable_verbose = p_settings->enable_verbose
+        };
+
+
+
+
+        int remaining_lines = (p_settings->mesh_height - 2) % block_count;
+        for (int j = 0; j < block_count; j++) {
+                
+                int tile_size = (tile_height + 2) * p_settings->mesh_width;
+                if((j == block_count - 1)){
+                        tile_size += remaining_lines * p_settings->mesh_width;
+                        settings_for_tile.mesh_height += (remaining_lines);
+                }
+                starpu_vector_data_register(handles_read + j, STARPU_MAIN_RAM, (uintptr_t)(p_mesh + (p_settings->mesh_width* (j * tile_height))), tile_size, sizeof(p_mesh[0]));
+                starpu_vector_data_register(handles_write + j, STARPU_MAIN_RAM, (uintptr_t)(p_mesh_result + 1 + (p_settings->mesh_width* (j * tile_height))), tile_size - 2, sizeof(p_mesh_result[0]));
+
+
+        }
+        for (int i = 0; i < p_settings->nb_iterations; i++){
+
+                for (int j = 0; j < block_count; j++) {
+
+                        starpu_data_handle_t sub_handle_read = *(handles_read + j);
+                        starpu_data_handle_t sub_handle_write = *(handles_write + j);
+                 starpu_task_insert(&stencil_codelet, STARPU_R, sub_handle_read, STARPU_R, sub_handle_write,STARPU_VALUE,  &settings_for_tile, sizeof(settings_for_tile), 0);  
+                }
+
+                starpu_task_wait_for_all();
+
+                for (int y = margin_y; y < p_settings->mesh_height - margin_y; y++)
+                {
+                        for (int x = margin_x; x < p_settings->mesh_width - margin_x; x++)
+                        {
+                                p_mesh[y * p_settings->mesh_width + x] = p_mesh_result[y * p_settings->mesh_width + x];
+                        }
+                }
+        }
+
+        for (int j = 0; j < block_count; j++) {
+                starpu_data_unregister(handles_read[j]);
+                starpu_data_unregister(handles_write[j]);
+        }
+
+        free(handles_read);
+        free(handles_write);
+        free(p_mesh_result);
+        starpu_shutdown();
+
+}
+// ---------------------------------------------
+
+
+// ---------------------------------------------
+//               STAR_PU + AVX implementation
+// ---------------------------------------------
+
+
+static void adapted_avx_stencil_func(const ELEMENT_TYPE *p_mesh, ELEMENT_TYPE *p_result_mesh, struct s_settings *p_settings)
+{
+        const int margin_y = (STENCIL_HEIGHT - 1) / 2;
+        int x;
+        int y = 0;
+
+        __m256 side_coefficients =  _mm256_set_ps(0.25 / 3,  0.50 / 3,  0.25 / 3,  0,         0, 0.25 / 3,  0.50 / 3,  0.25 / 3);
+        __m256 middle_coefficients = _mm256_set_ps(0.50 / 3,  0,  0.50 / 3,  0,        0, 0.50 / 3,  0,  0.50 / 3);
+
+        for (x = 0; x + 3 < p_settings->mesh_width; x += 2)
+        {
+                int offset_row_1 = (y * p_settings->mesh_width + x);
+                int offset_row_2 = ((y + 1) * p_settings->mesh_width + x);
+
+                __m128 lower_half_row_1 = _mm_loadu_ps(p_mesh + offset_row_1);
+                __m256 avx_row_1 = _mm256_set_m128(lower_half_row_1, lower_half_row_1);
+
+                __m128 lower_half_row_2 = _mm_loadu_ps(p_mesh + offset_row_2);
+                __m256 avx_row_2_middle = _mm256_set_m128(lower_half_row_2, lower_half_row_2);
+
+                avx_row_1 = _mm256_mul_ps(avx_row_1, side_coefficients);
+                avx_row_2_middle = _mm256_fmadd_ps(avx_row_2_middle, middle_coefficients, avx_row_1);
+
+                p_result_mesh[offset_row_2 + 1] += avx_row_2_middle[0] + avx_row_2_middle[1] + avx_row_2_middle[2] + avx_row_2_middle[3];
+                p_result_mesh[offset_row_2 + 2] += avx_row_2_middle[4] + avx_row_2_middle[5] + avx_row_2_middle[6] + avx_row_2_middle[7];
+        }
+        for (y = 1; y < p_settings->mesh_height - margin_y - 1; y++)
+        {
+                for (x = 0; x + 3 < p_settings->mesh_width; x += 2)
+                {
+                        int offset_row_1 = (y * p_settings->mesh_width + x);
+                        int offset_row_2 = ((y + 1) * p_settings->mesh_width + x);
+
+                        __m128 lower_half_row_1 = _mm_loadu_ps(p_mesh + offset_row_1);
+                        __m256 avx_row_1 = _mm256_set_m128(lower_half_row_1, lower_half_row_1);
+
+                        __m128 lower_half_row_2 = _mm_loadu_ps(p_mesh + offset_row_2);
+                        __m256 avx_row_2 = _mm256_set_m128(lower_half_row_2, lower_half_row_2);
+                        __m256 avx_row_2_middle = avx_row_2;
+
+                        avx_row_1 = _mm256_mul_ps(avx_row_1, side_coefficients);
+                        avx_row_2 = _mm256_mul_ps(avx_row_2, side_coefficients);
+                        avx_row_2_middle = _mm256_fmadd_ps(avx_row_2_middle, middle_coefficients, avx_row_1);
+
+                        p_result_mesh[offset_row_1 + 1] += avx_row_2[0] + avx_row_2[1] + avx_row_2[2] + avx_row_2[3];
+                        p_result_mesh[offset_row_1 + 2] += avx_row_2[4] + avx_row_2[5] + avx_row_2[6] + avx_row_2[7];
+
+                        p_result_mesh[offset_row_2 + 1] += avx_row_2_middle[0] + avx_row_2_middle[1] + avx_row_2_middle[2] + avx_row_2_middle[3];
+                        p_result_mesh[offset_row_2 + 2] += avx_row_2_middle[4] + avx_row_2_middle[5] + avx_row_2_middle[6] + avx_row_2_middle[7];
+                }
+        }
+         for (x = 0; x + 3 < p_settings->mesh_width; x += 2)
+                {
+                        int offset_row_1 = (y * p_settings->mesh_width + x);
+                        int offset_row_2 = ((y + 1) * p_settings->mesh_width + x);
+
+                        __m128 lower_half_row_1 = _mm_loadu_ps(p_mesh + offset_row_1);
+                        __m256 avx_row_1 = _mm256_set_m128(lower_half_row_1, lower_half_row_1);
+
+                        __m128 lower_half_row_2 = _mm_loadu_ps(p_mesh + offset_row_2);
+                        __m256 avx_row_2 = _mm256_set_m128(lower_half_row_2, lower_half_row_2);
+                        __m256 avx_row_2_middle = avx_row_2;
+
+                        avx_row_1 = _mm256_mul_ps(avx_row_1, side_coefficients);
+                        avx_row_2 = _mm256_mul_ps(avx_row_2, side_coefficients);
+                        avx_row_2_middle = _mm256_fmadd_ps(avx_row_2_middle, middle_coefficients, avx_row_1);
+
+                        p_result_mesh[offset_row_1 + 1] += avx_row_2[0] + avx_row_2[1] + avx_row_2[2] + avx_row_2[3];
+                        p_result_mesh[offset_row_1 + 2] += avx_row_2[4] + avx_row_2[5] + avx_row_2[6] + avx_row_2[7];
+
+                }
+}
+static void tile_stencil_avx_func(void *buffer[], void *cl_arg)
+{   
+        ELEMENT_TYPE *p_tile = (ELEMENT_TYPE *)STARPU_MATRIX_GET_PTR(buffer[0]);
+
+        ELEMENT_TYPE *p_tile_result = (ELEMENT_TYPE *)STARPU_MATRIX_GET_PTR(buffer[1]);
+        struct s_settings p_settings;
+        starpu_codelet_unpack_args(cl_arg, &p_settings) ;
+        adapted_avx_stencil_func(p_tile, p_tile_result, &p_settings);
+}
+static void starpu_stencil_avx_func(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
+{
+        const int margin_x = (STENCIL_WIDTH - 1) / 2;
+        const int margin_y = (STENCIL_HEIGHT - 1) / 2;
+
+        const int block_count = 1;
+        const int tile_height = (p_settings->mesh_height - 2) / block_count;
+
+        ELEMENT_TYPE *p_mesh_result = calloc(p_settings->mesh_height * p_settings->mesh_width, sizeof(float));
+        
+        int ret = starpu_init(NULL);
+        STARPU_CHECK_RETURN_VALUE(ret, "starpu_init");
+
+        struct starpu_codelet stencil_codelet = {
+                .cpu_funcs = {tile_stencil_avx_func},
+		.nbuffers = 2,
+		.modes = {STARPU_R}
+        };
+
+
+	starpu_data_handle_t* handles_read = malloc(block_count * sizeof(starpu_data_handle_t));
+	starpu_data_handle_t* handles_write = malloc(block_count * sizeof(starpu_data_handle_t));
+
+        
+
+        
+        struct s_settings settings_for_tile = {
+                .mesh_width = p_settings->mesh_width,
+                .mesh_height = tile_height + 2,
+                .initial_mesh_type = p_settings->initial_mesh_type,
+                .nb_iterations = p_settings->nb_iterations,
+                .nb_repeat = p_settings->nb_repeat,
+                .enable_output = p_settings->enable_output,
+                .enable_verbose = p_settings->enable_verbose
+        };
+
+
+
+
+        int remaining_lines = (p_settings->mesh_height - 2) % block_count;
+        for (int j = 0; j < block_count; j++) {
+                
+                int tile_size = (tile_height + 2) * p_settings->mesh_width;
+                if((j == block_count - 1)){
+                        tile_size += remaining_lines * p_settings->mesh_width;
+                        settings_for_tile.mesh_height += (remaining_lines);
+                }
+                starpu_vector_data_register(handles_read + j, STARPU_MAIN_RAM, (uintptr_t)(p_mesh + (p_settings->mesh_width* (j * tile_height))), tile_size, sizeof(p_mesh[0]));
+                starpu_vector_data_register(handles_write + j, STARPU_MAIN_RAM, (uintptr_t)(p_mesh_result + 1 + (p_settings->mesh_width* (j * tile_height))), tile_size - 2, sizeof(p_mesh_result[0]));
+
+
+        }
+        for (int i = 0; i < p_settings->nb_iterations; i++){
+
+                for (int j = 0; j < block_count; j++) {
+                        starpu_data_handle_t sub_handle_read = *(handles_read + j);
+                        starpu_data_handle_t sub_handle_write = *(handles_write + j);
+                 starpu_task_insert(&stencil_codelet, STARPU_R, sub_handle_read, STARPU_R, sub_handle_write,STARPU_VALUE,  &settings_for_tile, sizeof(settings_for_tile), 0);  
+                }
+
+                starpu_task_wait_for_all();
+
+                for (int y = margin_y; y < p_settings->mesh_height - margin_y; y++)
+                {
+                        for (int x = margin_x; x < p_settings->mesh_width - margin_x; x++)
+                        {
+                                p_mesh[y * p_settings->mesh_width + x] = p_mesh_result[y * p_settings->mesh_width + x + 1];
+                        }
+                }
+        }
+
+        for (int j = 0; j < block_count; j++) {
+                starpu_data_unregister(handles_read[j]);
+                starpu_data_unregister(handles_write[j]);
+        }
+
+        free(handles_read);
+        free(handles_write);
+        free(p_mesh_result);
+        starpu_shutdown();
+
+}
+// ---------------------------------------------
+
+
 static void naive_stencil_func(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
 {
         const int margin_x = (STENCIL_WIDTH - 1) / 2;
@@ -428,8 +781,7 @@ static void naive_stencil_func(ELEMENT_TYPE *p_mesh, struct s_settings *p_settin
                 }
         }
 }
-
-static void run(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
+static void run_naive(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
 {
         int i;
         for (i = 0; i < p_settings->nb_iterations; i++)
@@ -458,6 +810,54 @@ static void run(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
                 }
         }
 }
+static void run_avx(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
+{
+        int i;
+        for (i = 0; i < p_settings->nb_iterations; i++)
+        {
+                avx_stencil_func(p_mesh, p_settings);
+
+                if (p_settings->enable_output)
+                {
+                        char filename[32];
+                        snprintf(filename, 32, "run_mesh_%03d.csv", i);
+                        FILE *file = fopen(filename, "w");
+                        if (file == NULL)
+                        {
+                                perror("fopen");
+                                exit(EXIT_FAILURE);
+                        }
+                        write_mesh_to_file(file, p_mesh, p_settings);
+                        fclose(file);
+                }
+
+                if (p_settings->enable_verbose)
+                {
+                        printf("mesh after iteration %d\n", i);
+                        print_mesh(p_mesh, p_settings);
+                        printf("\n\n");
+                }
+        }
+}
+static void run_star_pu(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
+{
+        starpu_stencil_func(p_mesh, p_settings);
+}
+static void run_star_pu_avx(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
+{
+     starpu_stencil_avx_func(p_mesh, p_settings);
+}
+// ------------------------------------------------------------------------------------------
+//               Modify run() function with desired implementation :
+// ------------------------------------------------------------------------------------------
+
+static void run(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
+{
+     run_avx(p_mesh, p_settings);
+}
+
+// ------------------------------------------------------------------------------------------
+
 
 static int check(const ELEMENT_TYPE *p_mesh, ELEMENT_TYPE *p_mesh_copy, struct s_settings *p_settings)
 {
@@ -502,6 +902,7 @@ static int check(const ELEMENT_TYPE *p_mesh, ELEMENT_TYPE *p_mesh_copy, struct s
                                         p_mesh[y * p_settings->mesh_width + x],
                                         p_mesh_copy[y * p_settings->mesh_width + x]);
                                 check = 1;
+                                return check;
                         }
                 }
         }
