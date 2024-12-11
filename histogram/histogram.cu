@@ -569,8 +569,15 @@ static void cuda_compute_histogram(const ELEMENT_TYPE *array, int *histogram,
   }
 
   int threads_per_block = 1024;
+
+  int min_blocks_required = 24 * (2048 / threads_per_block);
+
   int blocks_per_grid =
       (p_settings->array_len + threads_per_block - 1) / threads_per_block;
+
+  if (blocks_per_grid < min_blocks_required) {
+    blocks_per_grid = min_blocks_required;
+  }
 
   compute_histogram<<<blocks_per_grid, threads_per_block>>>(
       d_array, d_histogram, bounds, p_settings->nb_bins, p_settings->array_len);

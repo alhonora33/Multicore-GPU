@@ -6,7 +6,7 @@ OUTPUT_FILE="histogram_results_native.txt"
 # Paramètres à varier
 ARRAY_LENS=(32 64 128 256 512 1024 2048 4096 8182 16364 32728 66456 132912 263824 527648 1055296 2110592 4221184 8442368)
 
-NB_BINS_LIST=(32 128 512 2048)         # Valeurs pour --nb-bins
+NB_BINS_LIST=(32 128 512 2048 4096)         # Valeurs pour --nb-bins
 NB_REPEAT=20                  # Fixe
 LOWER_BOUND=0                   # Fixe
 UPPER_BOUND=10                  # Fixe
