@@ -460,7 +460,7 @@ __global__ void compute_histogram_dico(const ELEMENT_TYPE *array,
 
     int low = 0, high = nb_bins - 1;
     while (low <= high) {
-      int mid = low + (low + high) / 2;
+      int mid = low + (high - low) / 2;
       if (value >= bounds[mid] && value < bounds[mid + 1]) {
         atomicAdd(&histogram[mid], 1);
         break;
