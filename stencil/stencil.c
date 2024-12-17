@@ -11,10 +11,10 @@
 
 #define ELEMENT_TYPE float
 
-#define DEFAULT_MESH_WIDTH 2000
-#define DEFAULT_MESH_HEIGHT 1000
+#define DEFAULT_MESH_WIDTH 3000
+#define DEFAULT_MESH_HEIGHT 9000
 #define DEFAULT_NB_ITERATIONS 100
-#define DEFAULT_NB_REPEAT 100
+#define DEFAULT_NB_REPEAT 10
 
 #define STENCIL_WIDTH 3
 #define STENCIL_HEIGHT 3
@@ -223,7 +223,7 @@ static void delete_settings(struct s_settings **pp_settings)
 static void allocate_mesh(ELEMENT_TYPE **pp_mesh, struct s_settings *p_settings)
 {
         assert(*pp_mesh == NULL);
-        ELEMENT_TYPE *p_mesh = calloc(p_settings->mesh_width * p_settings->mesh_height, sizeof(*p_mesh));
+        ELEMENT_TYPE *p_mesh = calloc(p_settings->mesh_width * p_settings->mesh_height,sizeof(*p_mesh));
 
         if (p_mesh == NULL)
         {
@@ -403,13 +403,13 @@ static void write_mesh_to_file(FILE *file, const ELEMENT_TYPE *p_mesh, struct s_
 // ---------------------------------------------
 
 static void avx_stencil_func(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
-{
+{       
         const int margin_x = (STENCIL_WIDTH - 1) / 2;
         const int margin_y = (STENCIL_HEIGHT - 1) / 2;
         int x;
         int y;
 
-        ELEMENT_TYPE *p_temporary_mesh = calloc(p_settings->mesh_width * p_settings->mesh_height, p_settings->mesh_width * p_settings->mesh_height * sizeof(*p_mesh));
+        ELEMENT_TYPE *p_temporary_mesh = calloc(p_settings->mesh_width * p_settings->mesh_height, sizeof(*p_mesh));
 
         __m256 side_coefficients = _mm256_set_ps(0.25 / 3, 0.50 / 3, 0.25 / 3, 0, 0, 0.25 / 3, 0.50 / 3, 0.25 / 3);
         __m256 middle_coefficients = _mm256_set_ps(0.50 / 3, 0, 0.50 / 3, 0, 0, 0.50 / 3, 0, 0.50 / 3);
@@ -449,6 +449,7 @@ static void avx_stencil_func(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings
         }
         free(p_temporary_mesh);
 }
+
 
 // ---------------------------------------------
 
@@ -495,7 +496,7 @@ static void starpu_stencil_func(ELEMENT_TYPE *p_mesh, struct s_settings *p_setti
         const int margin_x = (STENCIL_WIDTH - 1) / 2;
         const int margin_y = (STENCIL_HEIGHT - 1) / 2;
 
-        const int block_count = 4;
+        const int block_count = 12;
         const int tile_height = (p_settings->mesh_height - 2) / block_count;
 
         ELEMENT_TYPE *p_mesh_result = calloc(p_settings->mesh_height * p_settings->mesh_width, sizeof(float));
@@ -667,7 +668,7 @@ static void starpu_stencil_avx_func(ELEMENT_TYPE *p_mesh, struct s_settings *p_s
         const int margin_x = (STENCIL_WIDTH - 1) / 2;
         const int margin_y = (STENCIL_HEIGHT - 1) / 2;
 
-        const int block_count = 1;
+        const int block_count = 24;
         const int tile_height = (p_settings->mesh_height - 2) / block_count;
 
         ELEMENT_TYPE *p_mesh_result = calloc(p_settings->mesh_height * p_settings->mesh_width, sizeof(float));
@@ -805,7 +806,6 @@ static void run_naive(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
                 if (p_settings->enable_verbose)
                 {
                         printf("mesh after iteration %d\n", i);
-                        print_mesh(p_mesh, p_settings);
                         printf("\n\n");
                 }
         }
@@ -834,7 +834,6 @@ static void run_avx(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
                 if (p_settings->enable_verbose)
                 {
                         printf("mesh after iteration %d\n", i);
-                        print_mesh(p_mesh, p_settings);
                         printf("\n\n");
                 }
         }
@@ -853,7 +852,7 @@ static void run_star_pu_avx(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
 
 static void run(ELEMENT_TYPE *p_mesh, struct s_settings *p_settings)
 {
-     run_avx(p_mesh, p_settings);
+     run_star_pu_avx(p_mesh, p_settings);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -883,7 +882,6 @@ static int check(const ELEMENT_TYPE *p_mesh, ELEMENT_TYPE *p_mesh_copy, struct s
                 if (p_settings->enable_verbose)
                 {
                         printf("check mesh after iteration %d\n", i);
-                        print_mesh(p_mesh_copy, p_settings);
                         printf("\n\n");
                 }
         }
@@ -944,7 +942,6 @@ int main(int argc, char *argv[])
                         if (p_settings->enable_verbose)
                         {
                                 printf("initial mesh\n");
-                                print_mesh(p_mesh, p_settings);
                                 printf("\n\n");
                         }
 
